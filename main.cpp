@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
         } else {
             __builtin_unreachable();
         }
-        printf("Func: %d: C_true: %lu, C_false: %lu => %f => %d\n", func_idx, Entry.Counts[0], Entry.Counts[1], hint_value_f, hint_value);
+        // printf("Func: %d: C_true: %lu, C_false: %lu => %f => %d\n", func_idx, Entry.Counts[0], Entry.Counts[1], hint_value_f, hint_value);
 
         if (!hints.contains(func_idx)) {
             hints.insert({func_idx, std::map<uint32_t, uint8_t>()});
@@ -81,10 +81,43 @@ int main(int argc, char** argv) {
     }
 
     //
-    wabt::Custom branch_hints_section{wabt::Location(), "metadata.code.branch_hint"};
+    wabt::Custom branch_hints_section;
+    if (auto it = std::find_if(module.customs.begin(), module.customs.end(),
+                               [](const wabt::Custom& c) { return c.name == "metadata.code.branch_hint"; });
+        it != module.customs.end()) {
+        branch_hints_section = *it;
+        module.customs.erase(it);
+    } else {
+        branch_hints_section = wabt::Custom{wabt::Location(), "metadata.code.branch_hint"};
+    }
+    if (!branch_hints_section.data.empty()) {
+        auto* data = branch_hints_section.data.data();
+        auto* end = data + branch_hints_section.data.size();
+        uint32_t numFuncHints;
+        data += wabt::ReadU32Leb128(data, end, &numFuncHints);
+        for (uint32_t i = 0; i < numFuncHints; ++i) {
+            uint32_t func_idx;
+            data += wabt::ReadU32Leb128(data, end, &func_idx);
+            uint32_t numOffsets;
+            data += wabt::ReadU32Leb128(data, end, &numOffsets);
+            for (uint32_t j = 0; j < numOffsets; ++j) {
+                uint32_t offset;
+                data += wabt::ReadU32Leb128(data, end, &offset);
+                uint32_t size;
+                data += wabt::ReadU32Leb128(data, end, &size);
+                uint32_t value;
+                data += wabt::ReadU32Leb128(data, end, &value);
+                if (!hints.contains(func_idx)) {
+                    hints.insert({func_idx, std::map<uint32_t, uint8_t>()});
+                }
+                hints[func_idx].insert({offset, value});
+            }
+        }
+    }
+
     wabt::MemoryStream s{};
     wabt::WriteU32Leb128(&s, hints.size(), "num funcs");
-    for (auto [func_idx, offsets] : hints) {
+    for (const auto& [func_idx, offsets] : hints) {
         wabt::WriteU32Leb128(&s, func_idx, "func idx");
         wabt::WriteU32Leb128(&s, offsets.size(), "num offsets");
         for (auto [offset, value] : offsets) {
