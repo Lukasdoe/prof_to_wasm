@@ -8,7 +8,7 @@ find_package(LLVM REQUIRED)
 message(STATUS "Using LLVM version ${LLVM_VERSION} from ${LLVM_BINARY_DIR}")
 
 add_executable(prof_to_wasm main.cpp)
-add_compile_options(-frtti)
+target_compile_options(prof_to_wasm PUBLIC -fno-rtti)
 target_link_libraries(prof_to_wasm
         wabt::wabt
         LLVMCore

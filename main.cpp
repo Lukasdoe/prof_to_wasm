@@ -52,7 +52,7 @@ std::unique_ptr<wabt::Module> parse_module(const char* wasm_in) {
     return module;
 }
 
-auto parse_profile(const char* profile_in) {
+auto parse_profile(const char* profile_in, float prob_high, float prob_low) {
     auto FS = llvm::vfs::getRealFileSystem();
     auto readerRes = llvm::InstrProfReader::create(profile_in, *FS);
     if (auto err = readerRes.takeError()) {
@@ -75,13 +75,17 @@ auto parse_profile(const char* profile_in) {
             continue;
         }
         float hint_value_f = Entry.Counts[0] / static_cast<float>(Entry.Counts[0] + Entry.Counts[1]);
-        uint8_t hint_value = 0;
-        if (hint_value_f > 0.5) {
+        // Use thresholds to determine hint emission
+        uint8_t hint_value;
+        if (hint_value_f >= prob_high) {
             hint_value = 1; // true branch
-        } else if (hint_value_f <= 0.5) {
+            printf("%f >= %f\n", hint_value_f, prob_high);
+        } else if (hint_value_f <= prob_low) {
             hint_value = 0; // false branch
+            printf("%f < %f\n", hint_value_f, prob_low);
         } else {
-            __builtin_unreachable();
+            printf("%f between %f and %f\n", hint_value_f, prob_low, prob_high);
+            continue; // Do not emit a hint if between thresholds
         }
         printf("Func %d, Offset %d: C_true: %lu, C_false: %lu => %f => %d\n", func_idx, offset, Entry.Counts[0], Entry.Counts[1], hint_value_f, hint_value);
 
@@ -360,15 +364,34 @@ void dump_section_into_wasm_file(wabt::Custom &section, const char *wasm_in, con
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4) {
-        printf("Usage: %s <input.wasm> <output.wasm> <input.profraw>\n", argv[0]);
+    // Default threshold values
+    float prob_high = 0.5f;
+    float prob_low = 0.5f;
+
+    // Parse command-line flags
+    int argi = 1;
+    while (argi < argc && strncmp(argv[argi], "--wasm-branch-prob-", 19) == 0) {
+        if (strncmp(argv[argi], "--wasm-branch-prob-high=", 24) == 0) {
+            prob_high = std::stof(argv[argi] + 24);
+        } else if (strncmp(argv[argi], "--wasm-branch-prob-low=", 23) == 0) {
+            prob_low = std::stof(argv[argi] + 23);
+        } else {
+            printf("Unknown flag: %s\n", argv[argi]);
+            return 1;
+        }
+        ++argi;
     }
-    const char *wasm_in = argv[1];
-    const char *wasm_out = argv[2];
-    const char *profile_in = argv[3];
+
+    if (argc - argi != 3) {
+        printf("Usage: %s [--wasm-branch-prob-high=<float>] [--wasm-branch-prob-low=<float>] <input.wasm> <output.wasm> <input.profraw>\n", argv[0]);
+        return 1;
+    }
+    const char *wasm_in = argv[argi];
+    const char *wasm_out = argv[argi + 1];
+    const char *profile_in = argv[argi + 2];
 
     const auto module = parse_module(wasm_in);
-    auto [hints, entries] = parse_profile(profile_in);
+    auto [hints, entries] = parse_profile(profile_in, prob_high, prob_low);
     check_existing_hints(*module, entries);
     validate_profile_hints(*module, hints);
     wabt::Custom branch_hints = add_metadata_section(*module, hints);
