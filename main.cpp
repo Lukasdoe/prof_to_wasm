@@ -52,7 +52,7 @@ std::unique_ptr<wabt::Module> parse_module(const char* wasm_in) {
     return module;
 }
 
-auto parse_profile(const char* profile_in, float prob_high, float prob_low) {
+auto parse_profile(const char* profile_in, float prob_high, float prob_low, bool non_binary_hints) {
     auto FS = llvm::vfs::getRealFileSystem();
     auto readerRes = llvm::InstrProfReader::create(profile_in, *FS);
     if (auto err = readerRes.takeError()) {
@@ -75,17 +75,21 @@ auto parse_profile(const char* profile_in, float prob_high, float prob_low) {
             continue;
         }
         float hint_value_f = Entry.Counts[0] / static_cast<float>(Entry.Counts[0] + Entry.Counts[1]);
-        // Use thresholds to determine hint emission
         uint8_t hint_value;
-        if (hint_value_f >= prob_high) {
-            hint_value = 1; // true branch
-            printf("%f >= %f\n", hint_value_f, prob_high);
-        } else if (hint_value_f <= prob_low) {
-            hint_value = 0; // false branch
-            printf("%f < %f\n", hint_value_f, prob_low);
+        if (non_binary_hints) {
+            hint_value = static_cast<uint8_t>(hint_value_f * 127);
         } else {
-            printf("%f between %f and %f\n", hint_value_f, prob_low, prob_high);
-            continue; // Do not emit a hint if between thresholds
+            // Use thresholds to determine hint emission
+            if (hint_value_f >= prob_high) {
+                hint_value = 1; // true branch
+                printf("%f >= %f\n", hint_value_f, prob_high);
+            } else if (hint_value_f <= prob_low) {
+                hint_value = 0; // false branch
+                printf("%f < %f\n", hint_value_f, prob_low);
+            } else {
+                printf("%f between %f and %f\n", hint_value_f, prob_low, prob_high);
+                continue; // Do not emit a hint if between thresholds
+            }
         }
         printf("Func %d, Offset %d: C_true: %lu, C_false: %lu => %f => %d\n", func_idx, offset, Entry.Counts[0], Entry.Counts[1], hint_value_f, hint_value);
 
@@ -97,7 +101,7 @@ auto parse_profile(const char* profile_in, float prob_high, float prob_low) {
     return std::make_pair(hints, entries);
 }
 
-void check_existing_hints(wabt::Module &module, const std::unordered_set<std::pair<uint32_t, uint32_t>, PairHash> &entries) {
+void check_existing_hints(wabt::Module &module, const std::unordered_set<std::pair<uint32_t, uint32_t>, PairHash> &entries, std::map<uint32_t, std::map<uint32_t, uint8_t>>& hints, bool non_binary_hints) {
     if (auto it = std::ranges::find_if(module.customs,
                                        [](const wabt::Custom &c) { return c.name == "metadata.code.branch_hint"; });
         it != module.customs.end()) {
@@ -117,8 +121,15 @@ void check_existing_hints(wabt::Module &module, const std::unordered_set<std::pa
                 data += wabt::ReadU32Leb128(data, end, &size);
                 uint32_t value;
                 data += wabt::ReadU32Leb128(data, end, &value);
+                if (!non_binary_hints && value > 0x1) {
+                    std::cerr << "Error: found non-binary hint value with non-binary hints disabled" << std::endl;
+                    throw std::runtime_error{"Error: found non-binary hint value"};
+                }
                 if (!entries.contains({func_idx, offset})) {
-                    std::cerr << "Found existing hint for function " << func_idx << " at offset " << offset << " but did not find hints for func,offset in profile data." << std::endl;
+                    if (!hints.contains(func_idx)) {
+                        hints.insert({func_idx, std::map<uint32_t, uint8_t>()});
+                    }
+                    hints[func_idx].insert({offset, value});
                 }
             }
         }
@@ -367,14 +378,17 @@ int main(int argc, char **argv) {
     // Default threshold values
     float prob_high = 0.5f;
     float prob_low = 0.5f;
+    bool non_binary_hints = false;
 
     // Parse command-line flags
     int argi = 1;
-    while (argi < argc && strncmp(argv[argi], "--wasm-branch-prob-", 19) == 0) {
+    while (argi < argc && strncmp(argv[argi], "--", 2) == 0) {
         if (strncmp(argv[argi], "--wasm-branch-prob-high=", 24) == 0) {
             prob_high = std::stof(argv[argi] + 24);
         } else if (strncmp(argv[argi], "--wasm-branch-prob-low=", 23) == 0) {
             prob_low = std::stof(argv[argi] + 23);
+        } else if (strncmp(argv[argi], "--wasm-non-binary-hints", 23) == 0) {
+            non_binary_hints = true;
         } else {
             printf("Unknown flag: %s\n", argv[argi]);
             return 1;
@@ -382,8 +396,13 @@ int main(int argc, char **argv) {
         ++argi;
     }
 
+    if (non_binary_hints && (prob_high != 0.5f || prob_low != 0.5f)) {
+        std::cerr << "Error: --wasm-non-binary-hints cannot be used with --wasm-branch-prob-high or --wasm-branch-prob-low" << std::endl;
+        return 1;
+    }
+
     if (argc - argi != 3) {
-        printf("Usage: %s [--wasm-branch-prob-high=<float>] [--wasm-branch-prob-low=<float>] <input.wasm> <output.wasm> <input.profraw>\n", argv[0]);
+        printf("Usage: %s [--wasm-branch-prob-high=<float>] [--wasm-branch-prob-low=<float>] [--wasm-non-binary-hints] <input.wasm> <output.wasm> <input.profraw>\n", argv[0]);
         return 1;
     }
     const char *wasm_in = argv[argi];
@@ -391,8 +410,8 @@ int main(int argc, char **argv) {
     const char *profile_in = argv[argi + 2];
 
     const auto module = parse_module(wasm_in);
-    auto [hints, entries] = parse_profile(profile_in, prob_high, prob_low);
-    check_existing_hints(*module, entries);
+    auto [hints, entries] = parse_profile(profile_in, prob_high, prob_low, non_binary_hints);
+    check_existing_hints(*module, entries, hints, non_binary_hints);
     validate_profile_hints(*module, hints);
     wabt::Custom branch_hints = add_metadata_section(*module, hints);
     dump_section_into_wasm_file(branch_hints, wasm_in, wasm_out);
