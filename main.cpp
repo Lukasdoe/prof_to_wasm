@@ -69,8 +69,6 @@ auto parse_profile(const char* profile_in, float prob_high, float prob_low, bool
             throw std::runtime_error{std::format("Error parsing function index and offset from profile entry: {}", Entry.Name.str())};
         }
         assert(Entry.Counts.size() == 2);
-        entries.insert({func_idx, offset});
-
         if (Entry.Counts[0] + Entry.Counts[1] == 0) {
             continue;
         }
@@ -97,6 +95,7 @@ auto parse_profile(const char* profile_in, float prob_high, float prob_low, bool
             hints.insert({func_idx, std::map<uint32_t, uint8_t>()});
         }
         hints[func_idx].insert({offset, hint_value});
+        entries.insert({func_idx, offset});
     }
     return std::make_pair(hints, entries);
 }
