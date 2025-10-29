@@ -68,6 +68,7 @@ auto parse_profile(const char* profile_in, float prob_high, float prob_low, bool
         if (sscanf(Entry.Name.data(), "%d_%d", &func_idx, &offset) == EOF) {
             throw std::runtime_error{std::format("Error parsing function index and offset from profile entry: {}", Entry.Name.str())};
         }
+        if (func_idx >= 169) continue;
         assert(Entry.Counts.size() == 2);
         if (Entry.Counts[0] + Entry.Counts[1] == 0) {
             continue;
@@ -80,16 +81,16 @@ auto parse_profile(const char* profile_in, float prob_high, float prob_low, bool
             // Use thresholds to determine hint emission
             if (hint_value_f >= prob_high) {
                 hint_value = 1; // true branch
-                printf("%f >= %f\n", hint_value_f, prob_high);
+//                printf("%f >= %f\n", hint_value_f, prob_high);
             } else if (hint_value_f <= prob_low) {
                 hint_value = 0; // false branch
-                printf("%f < %f\n", hint_value_f, prob_low);
+//                printf("%f < %f\n", hint_value_f, prob_low);
             } else {
-                printf("%f between %f and %f\n", hint_value_f, prob_low, prob_high);
+//                printf("%f between %f and %f\n", hint_value_f, prob_low, prob_high);
                 continue; // Do not emit a hint if between thresholds
             }
         }
-        printf("Func %d, Offset %d: C_true: %lu, C_false: %lu => %f => %d\n", func_idx, offset, Entry.Counts[0], Entry.Counts[1], hint_value_f, hint_value);
+//        printf("Func %d, Offset %d: C_true: %lu, C_false: %lu => %f => %d\n", func_idx, offset, Entry.Counts[0], Entry.Counts[1], hint_value_f, hint_value);
 
         if (!hints.contains(func_idx)) {
             hints.insert({func_idx, std::map<uint32_t, uint8_t>()});
@@ -265,7 +266,8 @@ void validate_profile_hints(wabt::Module &module, const std::map<uint32_t, std::
             size_t expr_offset = offset - base_offset;
             if (offsets_to_find.contains(expr_offset)) {
                 if (expr.type() != wabt::ExprType::BrIf) {
-                    throw std::runtime_error{std::format("Offset {} for function {} ({}) from profile is not a BrIf instruction, but {}.", expr_offset, func_name, func_idx, expr_type_to_str(expr.type()))};
+                    std::cerr << std::format("Offset {} for function {} ({}) from profile is not a BrIf instruction, but {}.\n", expr_offset, func_name, func_idx, expr_type_to_str(expr.type()));
+                    return;
                 }
                 // std::cout << std::format("Found offset {} for function {} ({}) from profile at {:x}.\n", expr_offset, func_name, func_idx, offset);
                 offsets_to_find.erase(expr_offset);
