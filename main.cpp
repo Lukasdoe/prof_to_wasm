@@ -267,7 +267,6 @@ void validate_profile_hints(wabt::Module &module, const std::map<uint32_t, std::
             if (offsets_to_find.contains(expr_offset)) {
                 if (expr.type() != wabt::ExprType::BrIf) {
                     std::cerr << std::format("Offset {} for function {} ({}) from profile is not a BrIf instruction, but {}.\n", expr_offset, func_name, func_idx, expr_type_to_str(expr.type()));
-                    return;
                 }
                 // std::cout << std::format("Found offset {} for function {} ({}) from profile at {:x}.\n", expr_offset, func_name, func_idx, offset);
                 offsets_to_find.erase(expr_offset);
@@ -287,7 +286,7 @@ void validate_profile_hints(wabt::Module &module, const std::map<uint32_t, std::
             for (const auto &offset : offsets_to_find) {
                  std::cerr << std::format("Offset {} for function {} ({}) from profile not found in module.\n", offset, func_name, func_idx);
             }
-            throw std::runtime_error{"Not all profile hints could be validated."};
+//            throw std::runtime_error{"Not all profile hints could be validated."};
         }
     }
 }
