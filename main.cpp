@@ -52,6 +52,18 @@ std::unique_ptr<wabt::Module> parse_module(const char* wasm_in) {
     return module;
 }
 
+struct CallTargetInfo {
+    uint32_t func_idx;
+    uint64_t count;
+};
+
+struct ProfileData {
+    std::map<uint32_t, std::map<uint32_t, uint8_t>> branch_hints;
+    std::unordered_set<std::pair<uint32_t, uint32_t>, PairHash> branch_entries;
+    std::map<uint32_t, std::map<uint32_t, std::vector<CallTargetInfo>>> value_hints;
+    std::unordered_set<std::pair<uint32_t, uint32_t>, PairHash> value_entries;
+};
+
 auto parse_profile(const char* profile_in, float prob_high, float prob_low, bool non_binary_hints) {
     auto FS = llvm::vfs::getRealFileSystem();
     auto readerRes = llvm::InstrProfReader::create(profile_in, *FS);
@@ -60,8 +72,9 @@ auto parse_profile(const char* profile_in, float prob_high, float prob_low, bool
     }
     auto reader = std::move(readerRes.get());
     assert(reader->isIRLevelProfile());
-    std::map<uint32_t, std::map<uint32_t, uint8_t>> hints;
-    std::unordered_set<std::pair<uint32_t, uint32_t>, PairHash> entries;
+
+    ProfileData profile_data;
+
     for (const auto &Entry: *reader) {
         uint32_t func_idx;
         uint32_t offset;
@@ -69,39 +82,70 @@ auto parse_profile(const char* profile_in, float prob_high, float prob_low, bool
             throw std::runtime_error{std::format("Error parsing function index and offset from profile entry: {}", Entry.Name.str())};
         }
         if (func_idx >= 169) continue;
-        assert(Entry.Counts.size() == 2);
-        if (Entry.Counts[0] + Entry.Counts[1] == 0) {
-            continue;
-        }
-        float hint_value_f = Entry.Counts[0] / static_cast<float>(Entry.Counts[0] + Entry.Counts[1]);
-        uint8_t hint_value;
-        if (non_binary_hints) {
-            hint_value = std::min(static_cast<uint8_t>(hint_value_f * 128), static_cast<uint8_t>(127));
-        } else {
-            // Use thresholds to determine hint emission
-            if (hint_value_f >= prob_high) {
-                hint_value = 1; // true branch
-//                printf("%f >= %f\n", hint_value_f, prob_high);
-            } else if (hint_value_f <= prob_low) {
-                hint_value = 0; // false branch
-//                printf("%f < %f\n", hint_value_f, prob_low);
+
+        // Handle branch profiling (counter records)
+        if (Entry.Counts.size() == 2) {
+            if (Entry.Counts[0] + Entry.Counts[1] == 0) {
+                continue;
+            }
+            float hint_value_f = Entry.Counts[0] / static_cast<float>(Entry.Counts[0] + Entry.Counts[1]);
+            uint8_t hint_value;
+            if (non_binary_hints) {
+                hint_value = std::min(static_cast<uint8_t>(hint_value_f * 128), static_cast<uint8_t>(127));
             } else {
-//                printf("%f between %f and %f\n", hint_value_f, prob_low, prob_high);
-                continue; // Do not emit a hint if between thresholds
+                // Use thresholds to determine hint emission
+                if (hint_value_f >= prob_high) {
+                    hint_value = 1; // true branch
+                } else if (hint_value_f <= prob_low) {
+                    hint_value = 0; // false branch
+                } else {
+                    continue; // Do not emit a hint if between thresholds
+                }
+            }
+
+            if (!profile_data.branch_hints.contains(func_idx)) {
+                profile_data.branch_hints.insert({func_idx, std::map<uint32_t, uint8_t>()});
+            }
+            profile_data.branch_hints[func_idx].insert({offset, hint_value});
+            profile_data.branch_entries.insert({func_idx, offset});
+        }
+
+        // Handle value profiling records
+        // Value profile data contains target function indices for indirect calls
+        // The offset from the Entry name tells us which instruction this profile data is for
+        uint32_t numValueSites = Entry.getNumValueSites(llvm::IPVK_IndirectCallTarget);
+        if (numValueSites > 0) {
+            // For each value site in this entry, we collect the target function indices
+            // Typically there should be one value site per entry when using func_idx_offset naming
+            for (uint32_t site = 0; site < numValueSites; ++site) {
+                auto valueArray = Entry.getValueArrayForSite(llvm::IPVK_IndirectCallTarget, site);
+                if (valueArray.empty()) continue;
+
+                std::vector<CallTargetInfo> targets;
+                for (const auto &valueData : valueArray) {
+                    // valueData.Value contains the func_idx of the indirect call target
+                    // valueData.Count contains the number of times this target was called
+                    targets.push_back({static_cast<uint32_t>(valueData.Value), valueData.Count});
+                }
+
+                if (!targets.empty()) {
+                    if (!profile_data.value_hints.contains(func_idx)) {
+                        profile_data.value_hints.insert({func_idx, std::map<uint32_t, std::vector<CallTargetInfo>>()});
+                    }
+                    // Use the offset from the Entry name for this value site
+                    // If there are multiple sites, we might need to adjust the offset
+                    uint32_t site_offset = (numValueSites > 1) ? offset + site : offset;
+                    profile_data.value_hints[func_idx].insert({site_offset, std::move(targets)});
+                    profile_data.value_entries.insert({func_idx, site_offset});
+                }
             }
         }
-//        printf("%lu / %lu => %f => %d\n", Entry.Counts[0], Entry.Counts[1], hint_value_f, hint_value);
-
-        if (!hints.contains(func_idx)) {
-            hints.insert({func_idx, std::map<uint32_t, uint8_t>()});
-        }
-        hints[func_idx].insert({offset, hint_value});
-        entries.insert({func_idx, offset});
     }
-    return std::make_pair(hints, entries);
+    return profile_data;
 }
 
-void check_existing_hints(wabt::Module &module, const std::unordered_set<std::pair<uint32_t, uint32_t>, PairHash> &entries, std::map<uint32_t, std::map<uint32_t, uint8_t>>& hints, bool non_binary_hints) {
+void check_existing_hints(wabt::Module &module, ProfileData& profile_data, bool non_binary_hints) {
+    // Check existing branch hints
     if (auto it = std::ranges::find_if(module.customs,
                                        [](const wabt::Custom &c) { return c.name == "metadata.code.branch_hint"; });
         it != module.customs.end()) {
@@ -125,16 +169,56 @@ void check_existing_hints(wabt::Module &module, const std::unordered_set<std::pa
                     std::cerr << "Error: found non-binary hint value with non-binary hints disabled" << std::endl;
                     throw std::runtime_error{"Error: found non-binary hint value"};
                 }
-                if (!entries.contains({func_idx, offset})) {
-                    if (!hints.contains(func_idx)) {
-                        hints.insert({func_idx, std::map<uint32_t, uint8_t>()});
+                if (!profile_data.branch_entries.contains({func_idx, offset})) {
+                    if (!profile_data.branch_hints.contains(func_idx)) {
+                        profile_data.branch_hints.insert({func_idx, std::map<uint32_t, uint8_t>()});
                     }
-                    hints[func_idx].insert({offset, value});
+                    profile_data.branch_hints[func_idx].insert({offset, value});
                 }
             }
         }
         module.customs.erase(it);
+    }
+
+    // Check existing indirect call hints
+    if (auto it = std::ranges::find_if(module.customs,
+                                       [](const wabt::Custom &c) { return c.name == "metadata.code.call_targets"; });
+        it != module.customs.end()) {
+        auto *data = it->data.data();
+        auto *end = data + it->data.size();
+        uint32_t numFuncHints;
+        data += wabt::ReadU32Leb128(data, end, &numFuncHints);
+        for (uint32_t i = 0; i < numFuncHints; ++i) {
+            uint32_t func_idx;
+            data += wabt::ReadU32Leb128(data, end, &func_idx);
+            uint32_t numOffsets;
+            data += wabt::ReadU32Leb128(data, end, &numOffsets);
+            for (uint32_t j = 0; j < numOffsets; ++j) {
+                uint32_t offset;
+                data += wabt::ReadU32Leb128(data, end, &offset);
+                uint32_t hint_length;
+                data += wabt::ReadU32Leb128(data, end, &hint_length);
+                // Read targets with frequency percentages
+                std::vector<CallTargetInfo> targets;
+                auto *hint_end = data + hint_length;
+                while (data < hint_end) {
+                    uint32_t target_idx;
+                    data += wabt::ReadU32Leb128(data, end, &target_idx);
+                    uint32_t frequency_percent;
+                    data += wabt::ReadU32Leb128(data, end, &frequency_percent);
+                    // Convert percentage back to count (approximate, we don't have exact total)
+                    targets.push_back({target_idx, frequency_percent});
+                }
+                if (!profile_data.value_entries.contains({func_idx, offset})) {
+                    if (!profile_data.value_hints.contains(func_idx)) {
+                        profile_data.value_hints.insert({func_idx, std::map<uint32_t, std::vector<CallTargetInfo>>()});
+                    }
+                    profile_data.value_hints[func_idx].insert({offset, std::move(targets)});
+                }
+            }
         }
+        module.customs.erase(it);
+    }
 }
 
 std::string expr_type_to_str(wabt::ExprType type) {
@@ -242,8 +326,9 @@ void visit_exprs(const wabt::ExprList &exprs, auto f, size_t& prev_offset) {
     }
 }
 
-void validate_profile_hints(wabt::Module &module, const std::map<uint32_t, std::map<uint32_t, uint8_t>> &hints) {
-    for (const auto &[func_idx, offsets] : hints) {
+void validate_profile_hints(wabt::Module &module, const ProfileData &profile_data) {
+    // Validate branch hints
+    for (const auto &[func_idx, offsets] : profile_data.branch_hints) {
         wabt::Var func_var;
         func_var.set_index(func_idx);
         wabt::Func *func = module.GetFunc(func_var);
@@ -253,7 +338,6 @@ void validate_profile_hints(wabt::Module &module, const std::map<uint32_t, std::
 
         std::string func_name = func->name;
         size_t base_offset = func->loc.offset;
-        // std::cout << std::format("Validating function {} ({}) with base offset {:x}\n", func_name, func_idx, base_offset);
 
         std::set<uint32_t> offsets_to_find;
         for (const auto &offset : offsets | std::views::keys) {
@@ -266,32 +350,63 @@ void validate_profile_hints(wabt::Module &module, const std::map<uint32_t, std::
             size_t expr_offset = offset - base_offset;
             if (offsets_to_find.contains(expr_offset)) {
                 if (expr.type() != wabt::ExprType::BrIf) {
-                    std::cerr << std::format("Offset {} for function {} ({}) from profile is not a BrIf instruction, but {}.\n", expr_offset, func_name, func_idx, expr_type_to_str(expr.type()));
+                    std::cerr << std::format("Offset {} for function {} ({}) from branch profile is not a BrIf instruction, but {}.\n", expr_offset, func_name, func_idx, expr_type_to_str(expr.type()));
                 }
-                // std::cout << std::format("Found offset {} for function {} ({}) from profile at {:x}.\n", expr_offset, func_name, func_idx, offset);
                 offsets_to_find.erase(expr_offset);
             }
         };
-        auto print_func = [&](const wabt::Expr& expr, size_t offset) {
-                std::cout << std::format("{} | {:x}: {}\n", offset - base_offset, offset, expr_type_to_str(expr.type()));
-        };
 
-        // size_t offset = base_offset;
-        // visit_exprs(func->exprs, print_func, offset);
-        // std::cout.flush();
         size_t offset = base_offset;
         visit_exprs(func->exprs, validation_func, offset);
 
         if (!offsets_to_find.empty()) {
             for (const auto &offset : offsets_to_find) {
-                 std::cerr << std::format("Offset {} for function {} ({}) from profile not found in module.\n", offset, func_name, func_idx);
+                 std::cerr << std::format("Offset {} for function {} ({}) from branch profile not found in module.\n", offset, func_name, func_idx);
             }
-//            throw std::runtime_error{"Not all profile hints could be validated."};
+        }
+    }
+
+    // Validate indirect call hints
+    for (const auto &[func_idx, offsets] : profile_data.value_hints) {
+        wabt::Var func_var;
+        func_var.set_index(func_idx);
+        wabt::Func *func = module.GetFunc(func_var);
+        if (!func) {
+            throw std::runtime_error{std::format("Function with index {} from value profile not found in module.", func_idx)};
+        }
+
+        std::string func_name = func->name;
+        size_t base_offset = func->loc.offset;
+
+        std::set<uint32_t> offsets_to_find;
+        for (const auto &offset : offsets | std::views::keys) {
+            offsets_to_find.insert(offset);
+        }
+
+        auto validation_func = [&](const wabt::Expr& expr, size_t offset) {
+            if (offsets_to_find.empty()) return;
+
+            size_t expr_offset = offset - base_offset;
+            if (offsets_to_find.contains(expr_offset)) {
+                if (expr.type() != wabt::ExprType::CallIndirect) {
+                    std::cerr << std::format("Offset {} for function {} ({}) from value profile is not a CallIndirect instruction, but {}.\n", expr_offset, func_name, func_idx, expr_type_to_str(expr.type()));
+                }
+                offsets_to_find.erase(expr_offset);
+            }
+        };
+
+        size_t offset = base_offset;
+        visit_exprs(func->exprs, validation_func, offset);
+
+        if (!offsets_to_find.empty()) {
+            for (const auto &offset : offsets_to_find) {
+                 std::cerr << std::format("Offset {} for function {} ({}) from value profile not found in module.\n", offset, func_name, func_idx);
+            }
         }
     }
 }
 
-wabt::Custom add_metadata_section(wabt::Module &module, const std::map<uint32_t, std::map<uint32_t, uint8_t>> &hints) {
+wabt::Custom add_branch_metadata_section(wabt::Module &module, const std::map<uint32_t, std::map<uint32_t, uint8_t>> &hints) {
     wabt::MemoryStream s{};
     wabt::WriteU32Leb128(&s, hints.size(), "num funcs");
     for (const auto &[func_idx, offsets]: hints) {
@@ -308,11 +423,57 @@ wabt::Custom add_metadata_section(wabt::Module &module, const std::map<uint32_t,
     return branch_hints_section;
 }
 
-void dump_section_into_wasm_file(wabt::Custom &section, const char *wasm_in, const char *wasm_out) {
+wabt::Custom add_indirect_call_metadata_section(wabt::Module &module, const std::map<uint32_t, std::map<uint32_t, std::vector<CallTargetInfo>>> &hints) {
+    wabt::MemoryStream s{};
+    wabt::WriteU32Leb128(&s, hints.size(), "num funcs");
+    for (const auto &[func_idx, offsets]: hints) {
+        wabt::WriteU32Leb128(&s, func_idx, "func idx");
+        wabt::WriteU32Leb128(&s, offsets.size(), "num offsets");
+        for (const auto &[offset, targets]: offsets) {
+            // Calculate total count for percentage computation
+            uint64_t total_count = 0;
+            for (const auto &target : targets) {
+                total_count += target.count;
+            }
+
+            // Write offset
+            wabt::WriteU32Leb128(&s, offset, "offset");
+
+            // Write hint data to temporary stream to calculate length
+            wabt::MemoryStream hint_data{};
+            for (const auto &target : targets) {
+                wabt::WriteU32Leb128(&hint_data, target.func_idx, "target func_idx");
+                // Calculate frequency as percentage (0-100)
+                uint32_t frequency_percent = total_count > 0
+                    ? static_cast<uint32_t>((target.count * 100) / total_count)
+                    : 0;
+                wabt::WriteU32Leb128(&hint_data, frequency_percent, "call frequency percent");
+            }
+
+            // Write hint length
+            size_t hint_length = hint_data.output_buffer().data.size();
+            wabt::WriteU32Leb128(&s, hint_length, "hint length");
+
+            // Write hint data
+            s.WriteData(hint_data.output_buffer().data.data(), hint_length, "call targets");
+        }
+    }
+    wabt::Custom indirect_call_hints_section{wabt::Location(), "metadata.code.call_targets"};
+    indirect_call_hints_section.data = s.output_buffer().data;
+    return indirect_call_hints_section;
+}
+
+void dump_sections_into_wasm_file(const std::vector<wabt::Custom> &sections, const char *wasm_in, const char *wasm_out) {
     std::filesystem::copy_file(wasm_in, wasm_out, std::filesystem::copy_options::overwrite_existing);
     size_t og_size = std::filesystem::file_size(wasm_out);
-    size_t custom_section_size = 1 + 5 + 5 + section.name.size() + section.data.size();
-    size_t new_module_size = og_size + custom_section_size;
+
+    // Calculate total size of new sections
+    size_t total_custom_section_size = 0;
+    for (const auto &section : sections) {
+        total_custom_section_size += 1 + 5 + 5 + section.name.size() + section.data.size();
+    }
+
+    size_t new_module_size = og_size + total_custom_section_size;
     std::filesystem::resize_file(wasm_out, new_module_size);
 
     int file_fd = open(wasm_out, O_RDWR);
@@ -324,7 +485,7 @@ void dump_section_into_wasm_file(wabt::Custom &section, const char *wasm_in, con
     constexpr size_t version_len = 4;
     size_t off = magic_len + version_len;
 
-    // remove previous branch hints
+    // remove previous hints (both branch and indirect call)
     size_t removed_section_size = 0;
     while (off < new_module_size) {
         size_t section_start = off;
@@ -336,7 +497,7 @@ void dump_section_into_wasm_file(wabt::Custom &section, const char *wasm_in, con
             uint32_t name_len;
             const size_t name_size = wabt::ReadU32Leb128(file_map + off, file_map + new_module_size, &name_len);
             const std::string_view name{reinterpret_cast<const char *>(file_map + off + name_size), name_len};
-            if (name == "metadata.code.branch_hint") {
+            if (name == "metadata.code.branch_hint" || name == "metadata.code.indirect_call_hint" || name == "metadata.code.call_targets") {
                 const size_t section_end = section_start + 1 + size_size + section_size;
                 memmove(file_map + section_start, file_map + section_end, new_module_size - section_end);
                 removed_section_size += section_end - section_start;
@@ -354,21 +515,26 @@ void dump_section_into_wasm_file(wabt::Custom &section, const char *wasm_in, con
         const size_t size_size = wabt::ReadU32Leb128(file_map + off + 1, file_map + new_module_size, &section_size);
         off += 1 + size_size + section_size;
     }
-    // make space for branch hints
-    memmove(file_map + off + custom_section_size, file_map + off, og_size - off);
-    file_map[off++] = static_cast<uint8_t>(wabt::BinarySection::Custom);
-    // -1 because the section type byte is not counted
-    off += wabt::WriteFixedU32Leb128Raw(file_map + off, file_end, 5 + section.name.size() + section.data.size());
-    // name vec size
-    off += wabt::WriteFixedU32Leb128Raw(file_map + off, file_end, section.name.size());
-    // name vec
-    memcpy(file_map + off, section.name.data(), section.name.size());
-    off += section.name.size();
-    // data
-    memcpy(file_map + off, section.data.data(), section.data.size());
+
+    // Insert all custom sections before the code section
+    memmove(file_map + off + total_custom_section_size, file_map + off, og_size - off);
+
+    for (const auto &section : sections) {
+        file_map[off++] = static_cast<uint8_t>(wabt::BinarySection::Custom);
+        // -1 because the section type byte is not counted
+        off += wabt::WriteFixedU32Leb128Raw(file_map + off, file_end, 5 + section.name.size() + section.data.size());
+        // name vec size
+        off += wabt::WriteFixedU32Leb128Raw(file_map + off, file_end, section.name.size());
+        // name vec
+        memcpy(file_map + off, section.name.data(), section.name.size());
+        off += section.name.size();
+        // data
+        memcpy(file_map + off, section.data.data(), section.data.size());
+        off += section.data.size();
+    }
 
     // check that the moving worked
-    assert(file_map[off + section.data.size()] == static_cast<uint8_t>(wabt::BinarySection::Code));
+    assert(file_map[off] == static_cast<uint8_t>(wabt::BinarySection::Code));
 
     munmap(file_map, new_module_size);
     std::filesystem::resize_file(wasm_out, new_module_size - removed_section_size);
@@ -410,11 +576,25 @@ int main(int argc, char **argv) {
     const char *profile_in = argv[argi + 2];
 
     const auto module = parse_module(wasm_in);
-    auto [hints, entries] = parse_profile(profile_in, prob_high, prob_low, non_binary_hints);
-    check_existing_hints(*module, entries, hints, non_binary_hints);
-    validate_profile_hints(*module, hints);
-    wabt::Custom branch_hints = add_metadata_section(*module, hints);
-    dump_section_into_wasm_file(branch_hints, wasm_in, wasm_out);
+    auto profile_data = parse_profile(profile_in, prob_high, prob_low, non_binary_hints);
+    check_existing_hints(*module, profile_data, non_binary_hints);
+    validate_profile_hints(*module, profile_data);
+
+    std::vector<wabt::Custom> custom_sections;
+
+    if (!profile_data.branch_hints.empty()) {
+        custom_sections.push_back(add_branch_metadata_section(*module, profile_data.branch_hints));
+    }
+
+    if (!profile_data.value_hints.empty()) {
+        custom_sections.push_back(add_indirect_call_metadata_section(*module, profile_data.value_hints));
+    }
+
+    if (!custom_sections.empty()) {
+        dump_sections_into_wasm_file(custom_sections, wasm_in, wasm_out);
+    } else {
+        std::filesystem::copy_file(wasm_in, wasm_out, std::filesystem::copy_options::overwrite_existing);
+    }
 
     return 0;
 }
