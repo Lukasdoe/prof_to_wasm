@@ -76,7 +76,7 @@ auto parse_profile(const char* profile_in, float prob_high, float prob_low, bool
         float hint_value_f = Entry.Counts[0] / static_cast<float>(Entry.Counts[0] + Entry.Counts[1]);
         uint8_t hint_value;
         if (non_binary_hints) {
-            hint_value = static_cast<uint8_t>(hint_value_f * 127);
+            hint_value = std::min(static_cast<uint8_t>(hint_value_f * 128), static_cast<uint8_t>(127));
         } else {
             // Use thresholds to determine hint emission
             if (hint_value_f >= prob_high) {
@@ -90,7 +90,7 @@ auto parse_profile(const char* profile_in, float prob_high, float prob_low, bool
                 continue; // Do not emit a hint if between thresholds
             }
         }
-//        printf("Func %d, Offset %d: C_true: %lu, C_false: %lu => %f => %d\n", func_idx, offset, Entry.Counts[0], Entry.Counts[1], hint_value_f, hint_value);
+//        printf("%lu / %lu => %f => %d\n", Entry.Counts[0], Entry.Counts[1], hint_value_f, hint_value);
 
         if (!hints.contains(func_idx)) {
             hints.insert({func_idx, std::map<uint32_t, uint8_t>()});
