@@ -545,6 +545,8 @@ int main(int argc, char **argv) {
     float prob_high = 0.5f;
     float prob_low = 0.5f;
     bool non_binary_hints = false;
+    bool generate_branch_hints = false;
+    bool generate_call_target_hints = false;
 
     // Parse command-line flags
     int argi = 1;
@@ -555,6 +557,10 @@ int main(int argc, char **argv) {
             prob_low = std::stof(argv[argi] + 23);
         } else if (strncmp(argv[argi], "--wasm-non-binary-hints", 23) == 0) {
             non_binary_hints = true;
+        } else if (strncmp(argv[argi], "--wasm-branch-hints", 19) == 0) {
+            generate_branch_hints = true;
+        } else if (strncmp(argv[argi], "--wasm-call-target-hints", 24) == 0) {
+            generate_call_target_hints = true;
         } else {
             printf("Unknown flag: %s\n", argv[argi]);
             return 1;
@@ -567,8 +573,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (!generate_branch_hints && !generate_call_target_hints) {
+        std::cerr << "Error: At least one of --wasm-branch-hints or --wasm-call-target-hints must be specified" << std::endl;
+        return 1;
+    }
+
     if (argc - argi != 3) {
-        printf("Usage: %s [--wasm-branch-prob-high=<float>] [--wasm-branch-prob-low=<float>] [--wasm-non-binary-hints] <input.wasm> <output.wasm> <input.profraw>\n", argv[0]);
+        printf("Usage: %s [--wasm-branch-hints] [--wasm-call-target-hints] [--wasm-branch-prob-high=<float>] [--wasm-branch-prob-low=<float>] [--wasm-non-binary-hints] <input.wasm> <output.wasm> <input.profraw>\n", argv[0]);
         return 1;
     }
     const char *wasm_in = argv[argi];
@@ -582,11 +593,11 @@ int main(int argc, char **argv) {
 
     std::vector<wabt::Custom> custom_sections;
 
-    if (!profile_data.branch_hints.empty()) {
+    if (generate_branch_hints && !profile_data.branch_hints.empty()) {
         custom_sections.push_back(add_branch_metadata_section(*module, profile_data.branch_hints));
     }
 
-    if (!profile_data.value_hints.empty()) {
+    if (generate_call_target_hints && !profile_data.value_hints.empty()) {
         custom_sections.push_back(add_indirect_call_metadata_section(*module, profile_data.value_hints));
     }
 
