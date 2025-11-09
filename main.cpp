@@ -81,7 +81,6 @@ auto parse_profile(const char* profile_in, float prob_high, float prob_low, bool
         if (sscanf(Entry.Name.data(), "%d_%d", &func_idx, &offset) == EOF) {
             throw std::runtime_error{std::format("Error parsing function index and offset from profile entry: {}", Entry.Name.str())};
         }
-        if (func_idx >= 169) continue;
 
         // Handle branch profiling (counter records)
         if (Entry.Counts.size() == 2) {
@@ -115,29 +114,23 @@ auto parse_profile(const char* profile_in, float prob_high, float prob_low, bool
         // The offset from the Entry name tells us which instruction this profile data is for
         uint32_t numValueSites = Entry.getNumValueSites(llvm::IPVK_IndirectCallTarget);
         if (numValueSites > 0) {
-            // For each value site in this entry, we collect the target function indices
-            // Typically there should be one value site per entry when using func_idx_offset naming
-            for (uint32_t site = 0; site < numValueSites; ++site) {
-                auto valueArray = Entry.getValueArrayForSite(llvm::IPVK_IndirectCallTarget, site);
-                if (valueArray.empty()) continue;
+            assert(numValueSites == 1 && "Multiple value sites per entry not supported in this tool");
+            auto valueArray = Entry.getValueArrayForSite(llvm::IPVK_IndirectCallTarget, 0);
+            if (valueArray.empty()) continue;
 
-                std::vector<CallTargetInfo> targets;
-                for (const auto &valueData : valueArray) {
-                    // valueData.Value contains the func_idx of the indirect call target
-                    // valueData.Count contains the number of times this target was called
-                    targets.push_back({static_cast<uint32_t>(valueData.Value), valueData.Count});
-                }
+            std::vector<CallTargetInfo> targets;
+            for (const auto &valueData : valueArray) {
+                // valueData.Value contains the func_idx of the indirect call target
+                // valueData.Count contains the number of times this target was called
+                targets.push_back({static_cast<uint32_t>(valueData.Value), valueData.Count});
+            }
 
-                if (!targets.empty()) {
-                    if (!profile_data.value_hints.contains(func_idx)) {
-                        profile_data.value_hints.insert({func_idx, std::map<uint32_t, std::vector<CallTargetInfo>>()});
-                    }
-                    // Use the offset from the Entry name for this value site
-                    // If there are multiple sites, we might need to adjust the offset
-                    uint32_t site_offset = (numValueSites > 1) ? offset + site : offset;
-                    profile_data.value_hints[func_idx].insert({site_offset, std::move(targets)});
-                    profile_data.value_entries.insert({func_idx, site_offset});
+            if (!targets.empty()) {
+                if (!profile_data.value_hints.contains(func_idx)) {
+                    profile_data.value_hints.insert({func_idx, std::map<uint32_t, std::vector<CallTargetInfo>>()});
                 }
+                profile_data.value_hints[func_idx].insert({offset, std::move(targets)});
+                profile_data.value_entries.insert({func_idx, offset});
             }
         }
     }
